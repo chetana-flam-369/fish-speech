@@ -7,14 +7,14 @@ import asyncio
 import logging
 from typing import Any, Callable
 
-from sglang_omni.pipeline.input_handler import DirectInput, InputHandler
-from sglang_omni.pipeline.worker import Worker
-from sglang_omni.proto import (
+from sglang_omni.core.types import (
     DataReadyMessage,
     ShutdownMessage,
     StageInfo,
     SubmitMessage,
 )
+from sglang_omni.pipeline.input_handler import DirectInput, InputHandler
+from sglang_omni.pipeline.worker import Worker
 from sglang_omni.transport.control_plane import StageControlPlane
 from sglang_omni.transport.data_plane import SHMDataPlane
 

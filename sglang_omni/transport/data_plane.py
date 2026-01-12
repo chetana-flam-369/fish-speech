@@ -6,7 +6,7 @@ import pickle
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
-from sglang_omni.proto import SHMMetadata
+from sglang_omni.core.types import SHMMetadata
 
 logger = logging.getLogger(__name__)
 

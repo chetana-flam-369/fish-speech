@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import Any
 
-from sglang_omni.proto import (
+from sglang_omni.core.types import (
     AbortMessage,
     CompleteMessage,
     RequestInfo,

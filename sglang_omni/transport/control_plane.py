@@ -8,7 +8,7 @@ import msgpack
 import zmq
 import zmq.asyncio
 
-from sglang_omni.proto import (
+from sglang_omni.core.types import (
     AbortMessage,
     CompleteMessage,
     DataReadyMessage,

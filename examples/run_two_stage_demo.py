@@ -15,8 +15,12 @@ Tests:
 import asyncio
 import logging
 import multiprocessing as mp
+import sys
 import time
 from typing import Any
+
+# Add parent directory to path for imports
+sys.path.insert(0, "/vllm-workspace/sglang-omni")
 
 from sglang_omni import Coordinator
 
