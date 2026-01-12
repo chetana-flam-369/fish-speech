@@ -15,8 +15,8 @@ from sglang_omni.core.types import (
 )
 from sglang_omni.pipeline.input_handler import DirectInput, InputHandler
 from sglang_omni.pipeline.worker import Worker
+from sglang_omni.relay import SHMRelay
 from sglang_omni.transport.control_plane import StageControlPlane
-from sglang_omni.transport.data_plane import SHMDataPlane
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class Stage:
         self.input_handler = input_handler or DirectInput()
 
         # Components
-        self.data_plane = SHMDataPlane()
+        self.data_plane = SHMRelay()
         self.control_plane = StageControlPlane(
             stage_name=name,
             recv_endpoint=recv_endpoint,
@@ -198,7 +198,7 @@ class Stage:
             return
 
         # Read data from SHM
-        result = self.data_plane.get(
+        result = self.data_plane.get_object(
             request_id=request_id,
             metadata=msg.shm_metadata,
             from_stage=msg.from_stage,

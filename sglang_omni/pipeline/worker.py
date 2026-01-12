@@ -98,7 +98,7 @@ class Worker:
         logger.debug("Worker: routing %s to %s", request_id, next_stage)
 
         # Write to SHM
-        success, metadata = self.stage.data_plane.put(
+        success, metadata = self.stage.data_plane.put_object(
             request_id=request_id,
             data=data,
             from_stage=self.stage.name,
