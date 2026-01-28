@@ -8,12 +8,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
-from transformers import AutoTokenizer
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
-from sglang_omni.executors import EngineExecutor
-from sglang_omni.models.omni_generic import create_adapter_thinker_executor
-from sglang_omni.models.qwen3_omni.common import instantiate_module, load_thinker_config
+from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
+from sglang_omni.models.utils.hf import instantiate_module
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
 
 TEXT_MODEL_PREFIX = ("thinker.model.", "model.")
@@ -167,12 +165,13 @@ class Qwen3OmniSplitThinker(nn.Module):
         inputs_embeds: torch.Tensor,
         image_embeds: torch.Tensor | None,
         audio_embeds: torch.Tensor | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         image_mask, _, audio_mask = self.thinker.get_placeholder_mask(
             input_ids,
             inputs_embeds=inputs_embeds,
             image_features=image_embeds,
         )
+        image_mask_out = image_mask if image_embeds is not None else None
 
         if image_embeds is not None:
             image_embeds = image_embeds.to(
@@ -196,7 +195,7 @@ class Qwen3OmniSplitThinker(nn.Module):
             )
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
 
-        return inputs_embeds
+        return inputs_embeds, image_mask_out
 
     def forward(
         self,
@@ -209,6 +208,8 @@ class Qwen3OmniSplitThinker(nn.Module):
     ):
         image_embeds_t = _concat_features(image_embeds)
         audio_embeds_t = _concat_features(audio_embeds)
+        deepstack_visual_embeds = kwargs.pop("deepstack_visual_embeds", None)
+        visual_pos_masks = kwargs.pop("visual_pos_masks", None)
 
         if inputs_embeds is not None:
             inputs_embeds = inputs_embeds.to(self._device)
@@ -229,12 +230,21 @@ class Qwen3OmniSplitThinker(nn.Module):
             audio_embeds_t = (
                 audio_embeds_t.to(self._device) if audio_embeds_t is not None else None
             )
-            inputs_embeds = self._merge_embeddings(
+            inputs_embeds, image_mask = self._merge_embeddings(
                 input_ids=input_ids.to(self._device),
                 inputs_embeds=inputs_embeds,
                 image_embeds=image_embeds_t,
                 audio_embeds=audio_embeds_t,
             )
+        else:
+            image_mask = None
+
+        if deepstack_visual_embeds is not None:
+            kwargs["deepstack_visual_embeds"] = deepstack_visual_embeds
+            if visual_pos_masks is not None:
+                kwargs["visual_pos_masks"] = visual_pos_masks
+            elif image_mask is not None:
+                kwargs["visual_pos_masks"] = image_mask
 
         return self.thinker(
             input_ids=input_ids.to(self._device),
@@ -246,22 +256,3 @@ class Qwen3OmniSplitThinker(nn.Module):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-
-
-def create_thinker_executor(
-    model_id: str,
-    *,
-    adapter_name: str,
-    device: str = "cuda",
-    dtype: str | None = None,
-    max_seq_len: int = 8192,
-) -> EngineExecutor:
-    model = Qwen3OmniSplitThinker(model_id=model_id, device=device, dtype=dtype)
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    return create_adapter_thinker_executor(
-        adapter_name,
-        model=model,
-        tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
-        device=device,
-    )

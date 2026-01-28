@@ -7,10 +7,8 @@ import torch
 import torch.nn as nn
 from transformers.models.qwen3_omni_moe import modeling_qwen3_omni_moe as hf_modeling
 
-from sglang_omni.executors import EngineExecutor
-from sglang_omni.models.omni_generic import create_adapter_encoder_executor
-from sglang_omni.models.qwen3_omni.adapter import IMAGE_STAGE
-from sglang_omni.models.qwen3_omni.common import instantiate_module, load_thinker_config
+from sglang_omni.models.qwen3_omni.components.common import load_thinker_config
+from sglang_omni.models.utils.hf import instantiate_module
 from sglang_omni.models.weight_loader import load_module, resolve_dtype
 
 VISUAL_PREFIX = ("thinker.visual.", "visual.")
@@ -66,24 +64,14 @@ class Qwen3OmniImageEncoder(nn.Module):
     ) -> dict[str, torch.Tensor]:
         image_grid_thw = image_grid_thw.to(self._device, dtype=torch.long)
         pixel_values = pixel_values.to(device=self._device, dtype=self.visual.dtype)
-        image_embeds, _ = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, image_embeds_multiscale = self.visual(
+            pixel_values, grid_thw=image_grid_thw
+        )
         merge = self.spatial_merge_size**2
         image_token_counts = image_grid_thw.prod(-1) // merge
         return {
             "image_embeds": image_embeds,
             "image_grid_thw": image_grid_thw,
             "image_token_counts": image_token_counts.to(device=self._device),
+            "deepstack_visual_embeds": image_embeds_multiscale,
         }
-
-
-def create_image_encoder_executor(
-    model_id: str,
-    *,
-    adapter_name: str,
-    device: str = "cuda",
-    dtype: str | None = None,
-) -> EngineExecutor:
-    model = Qwen3OmniImageEncoder(model_id=model_id, device=device, dtype=dtype)
-    return create_adapter_encoder_executor(
-        adapter_name, stage_name=IMAGE_STAGE, model=model
-    )
