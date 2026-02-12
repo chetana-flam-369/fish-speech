@@ -35,6 +35,7 @@ import uvicorn
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig, PipelineRunner, compile_pipeline
 from sglang_omni.serve.openai_api import create_app
+from sglang_omni.utils import import_string
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,6 @@ def _resolve_builtin(
         raise ValueError(
             f"Unknown built-in pipeline: {pipeline_name!r}. " f"Available: {available}"
         )
-
-    from sglang_omni.config.imports import import_string
 
     factory_path = _BUILTIN_PIPELINES[pipeline_name]
     factory = import_string(factory_path)

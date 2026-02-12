@@ -6,7 +6,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sglang_omni.config.imports import import_string
 from sglang_omni.config.schema import (
     ExecutorConfig,
     InputHandlerConfig,
@@ -22,6 +21,7 @@ from sglang_omni.pipeline import (
     Worker,
 )
 from sglang_omni.pipeline.stage.input import InputHandler
+from sglang_omni.utils import import_string
 
 
 def compile_pipeline(config: PipelineConfig) -> tuple[Coordinator, list[Stage]]:
