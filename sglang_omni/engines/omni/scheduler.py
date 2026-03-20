@@ -243,12 +243,16 @@ class Scheduler:
     def _emit_stream(self, request: SchedulerRequest, output: RequestOutput) -> None:
         if self._stream_adapter is None:
             return
-        queue = self._stream_queues.get(request.request_id)
-        if queue is None:
-            return
         item = self._stream_adapter(request, output)
         if item is None:
             return
+        # Auto-create queue to prevent race: if _subscribe_stream hasn't been
+        # called yet, items would be dropped. Pre-creating ensures no items lost.
+        queue = self._stream_queues.get(request.request_id)
+        if queue is None:
+            import asyncio as _asyncio
+            queue = _asyncio.Queue()
+            self._stream_queues[request.request_id] = queue
         queue.put_nowait(item)
 
     def _finish_request(

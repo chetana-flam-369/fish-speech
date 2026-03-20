@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -23,6 +24,20 @@ from sglang_omni.models.fishaudio_s2_pro.pipeline.state_io import (
 from sglang_omni.proto import StagePayload
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-process streaming queues (bypasses ZMQ/msgpack for VQ code payloads)
+#
+# The tts_engine worker and the API server share the same asyncio event loop
+# (same process).  Rather than serialising large list[list[int]] arrays
+# through msgpack → ZMQ → msgpack, we drop the payload directly into an
+# asyncio.Queue that the /stream endpoint consumes.
+#
+# Protocol:
+#   - Each item is  list[list[int]]  (shape [num_codebooks, CHUNK_TOKENS])
+#   - A  None  sentinel signals end-of-stream.
+# ---------------------------------------------------------------------------
+_vq_streaming_queues: dict[str, asyncio.Queue] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -53,9 +68,21 @@ def _load_audio_decoder(checkpoint: str, device: str):
     t0 = time.perf_counter()
 
     config = FishQwen3OmniConfig.from_pretrained(checkpoint)
-    model = FishQwen3OmniForCausalLM.from_pretrained(checkpoint, config=config)
-    model = model.to(dtype=torch.bfloat16).eval()
 
+    # Load directly in bfloat16 to avoid a float32→bfloat16 conversion step
+    # (halves peak CPU RAM).  Do NOT use low_cpu_mem_usage=True — with some
+    # versions of accelerate it can silently dispatch layers to the GPU even
+    # without device_map, which exhausts VRAM before SGLang starts.
+    model = FishQwen3OmniForCausalLM.from_pretrained(
+        checkpoint,
+        config=config,
+        torch_dtype=torch.bfloat16,
+    )
+    model.eval()
+
+    # Extract the audio decoder sub-module and move only it to the target device.
+    # The rest of the full model (text transformer) is immediately freed so that
+    # SGLang can claim maximum VRAM for the KV cache.
     audio_decoder = model.audio_decoder
     audio_decoder.to(device=device)
     num_codebooks = config.audio_decoder_config.num_codebooks
@@ -116,11 +143,18 @@ def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
     tokenizer = PreTrainedTokenizerFast.from_pretrained(checkpoint_dir)
     adapter = S2ProTokenizerAdapter(tokenizer)
 
-    codec = _load_codec(checkpoint_dir, "cpu")
+    # Lazy-loaded codec
+    _codec_cache: dict[str, Any] = {}
+
+    def _get_codec(device: str = "cpu"):
+        if "codec" not in _codec_cache:
+            _codec_cache["codec"] = _load_codec(checkpoint_dir, device)
+        return _codec_cache["codec"]
 
     def _encode_reference_audio(audio_path: str, device: str = "cpu") -> torch.Tensor:
         import torchaudio
 
+        codec = _get_codec(device)
         audio, sr = torchaudio.load(audio_path)
         if audio.shape[0] > 1:
             audio = audio.mean(0, keepdim=True)
@@ -213,16 +247,17 @@ def create_sglang_tts_engine_executor(
     audio_decoder, num_codebooks, codebook_size, tokenizer, checkpoint_dir = (
         _load_audio_decoder(model_path, device)
     )
+    audio_decoder.setup_caches(max_batch_size=1, dtype=torch.bfloat16)
 
     _patch_fish_config_for_sglang(checkpoint_dir)
     server_args = ServerArgs(
         model_path=checkpoint_dir,
         tp_size=1,
         dtype="bfloat16",
-        mem_fraction_static=0.85,
+        mem_fraction_static=0.70,
         chunked_prefill_size=8192,
         max_running_requests=64,
-        disable_cuda_graph=False,
+        disable_cuda_graph=True,
     )
 
     engine = create_s2pro_sglang_engine(
@@ -236,11 +271,105 @@ def create_sglang_tts_engine_executor(
         top_k=top_k,
     )
 
+    # -----------------------------------------------------------------------
+    # Streaming: emit raw VQ code chunks every CHUNK_TOKENS decode steps.
+    #
+    # item from _stream_adapter (factory.py) is step_out.codes:
+    #   CUDA tensor of shape [num_codebooks+1, 1] per decode step.
+    # Row 0 = semantic token (skip). Rows 1..num_codebooks = DAC codes.
+    #
+    # We do NOT call the DAC codec here — that would block the asyncio
+    # event loop and stall the LLM.  Instead we return raw integer codes
+    # (modality="vq_codes") so the API process can decode them in a
+    # thread pool without touching the GPU event loop.
+    # -----------------------------------------------------------------------
+    _CHUNK_TOKENS = 10  # emit every 10 tokens ≈ 116 ms of audio
+
+    _req_buffers: dict[str, list] = {}   # per-request list of CPU code tensors
+    _req_ttft_done: set[str] = set()     # requests whose TTFT was already logged
+    _req_tstart: dict[str, float] = {}   # request start timestamps
+
     def _request_builder(payload: StagePayload):
+        _req_tstart[payload.request_id] = time.perf_counter()
         state = load_state(payload)
         return build_sglang_tts_request(state, tokenizer)
 
+    def _stream_builder(payload: StagePayload, item: Any) -> Any:
+        """Called once per LLM decode step.  item = CUDA tensor [CB+1, 1].
+
+        Accumulates CHUNK_TOKENS frames, then sends the batch directly to the
+        API process via an in-process asyncio.Queue — no ZMQ/msgpack involved
+        for the actual payload, which avoids silent serialisation failures.
+
+        Returns {} (empty heartbeat) through the ZMQ path every step so the
+        coordinator still sees stream events and stays alive.
+        """
+        if item is None:
+            return {}
+
+        req_id = payload.request_id
+
+        # Move to CPU — fast memcpy, does not block event loop.
+        try:
+            codes_cpu = item.detach().cpu()  # [num_codebooks+1, 1]
+        except Exception as exc:
+            logger.warning("[STREAM] Failed to move codes to CPU: %s", exc)
+            return {}
+
+        # Log TTFT exactly once per request.
+        if req_id not in _req_ttft_done:
+            t0 = _req_tstart.get(req_id, time.perf_counter())
+            logger.info(
+                "[TIMING] TTFT (sglang prefill→first token): %.1f ms",
+                (time.perf_counter() - t0) * 1000,
+            )
+            _req_ttft_done.add(req_id)
+
+        # Accumulate frames.
+        buf = _req_buffers.setdefault(req_id, [])
+        buf.append(codes_cpu)
+
+        if len(buf) < _CHUNK_TOKENS:
+            return {}
+
+        # Flush CHUNK_TOKENS frames into the in-process queue.
+        chunk_codes = buf[:_CHUNK_TOKENS]
+        _req_buffers[req_id] = buf[_CHUNK_TOKENS:]
+
+        # Stack: [num_codebooks+1, CHUNK_TOKENS] → skip row 0 (semantic).
+        stacked = torch.cat(chunk_codes, dim=1)   # [num_codebooks+1, CHUNK_TOKENS]
+        codebook_data = stacked[1:].tolist()       # list[list[int]]
+
+        q = _vq_streaming_queues.get(req_id)
+        if q is not None:
+            q.put_nowait(codebook_data)
+        else:
+            logger.debug("[STREAM] No in-process queue for req %s; chunk dropped", req_id)
+
+        # Return empty dict — just a lightweight ZMQ heartbeat, no payload.
+        return {}
+
     def _result_builder(payload: StagePayload, result: Any) -> StagePayload:
+        """Clean up per-request streaming state after LLM finishes."""
+        req_id = payload.request_id
+
+        # Flush any remaining tokens that didn't fill a full chunk.
+        buf = _req_buffers.get(req_id, [])
+        if buf:
+            stacked = torch.cat(buf, dim=1)
+            remaining = stacked[1:].tolist()
+            q = _vq_streaming_queues.get(req_id)
+            if q is not None:
+                q.put_nowait(remaining)
+
+        # Signal end-of-stream to the API process.
+        q = _vq_streaming_queues.get(req_id)
+        if q is not None:
+            q.put_nowait(None)
+
+        _req_buffers.pop(req_id, None)
+        _req_ttft_done.discard(req_id)
+        _req_tstart.pop(req_id, None)
         state = load_state(payload)
         apply_tts_result(state, result)
         return store_state(payload, state)
@@ -249,6 +378,7 @@ def create_sglang_tts_engine_executor(
         engine=engine,
         request_builder=_request_builder,
         result_builder=_result_builder,
+        stream_builder=_stream_builder,
     )
 
 
@@ -283,15 +413,6 @@ def create_vocoder_executor(
         payload.data["audio_data"] = audio_np.tolist()
         payload.data["sample_rate"] = codec.sample_rate
         payload.data["modality"] = "audio"
-        if state.prompt_tokens or state.completion_tokens:
-            usage = {
-                "prompt_tokens": state.prompt_tokens,
-                "completion_tokens": state.completion_tokens,
-                "total_tokens": state.prompt_tokens + state.completion_tokens,
-            }
-            if state.engine_time_s:
-                usage["engine_time_s"] = round(state.engine_time_s, 6)
-            payload.data["usage"] = usage
         return payload
 
     return PreprocessingExecutor(_vocode)
